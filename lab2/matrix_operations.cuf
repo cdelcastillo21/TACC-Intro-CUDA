@@ -1,0 +1,214 @@
+module cuda_module
+  use cudafor
+  contains
+  
+  ! CUDA kernel for matrix addition using 2D block and grid
+  attributes(global) subroutine matrixAdd(d_a, d_b, d_c, width, height)
+    implicit none
+    integer, value :: width, height
+    integer, device, intent(in) :: d_a(width, height), d_b(width, height)
+    integer, device, intent(out) :: d_c(width, height)
+    integer :: col, row
+    
+    ! Calculate the row and column indices for this thread
+    col = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    row = (blockIdx%y - 1) * blockDim%y + threadIdx%y
+    
+    ! Make sure we don't go out of bounds
+    if (col <= width .and. row <= height) then
+      ! Perform the addition
+      d_c(col, row) = d_a(col, row) + d_b(col, row)
+    end if
+  end subroutine matrixAdd
+  
+  ! CUDA kernel for matrix transposition using 2D block and grid
+  attributes(global) subroutine matrixTranspose(d_in, d_out, width, height)
+    implicit none
+    integer, value :: width, height
+    integer, device, intent(in) :: d_in(width, height)
+    integer, device, intent(out) :: d_out(height, width)  ! Note dimensions are swapped
+    integer :: col, row
+    
+    ! Calculate the row and column indices for this thread
+    col = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    row = (blockIdx%y - 1) * blockDim%y + threadIdx%y
+    
+    ! Make sure we don't go out of bounds
+    if (col <= width .and. row <= height) then
+      ! Perform the transposition - note the swapped indices
+      d_out(row, col) = d_in(col, row)
+    end if
+  end subroutine matrixTranspose
+  
+end module cuda_module
+
+program matrix_operations_fortran
+  use cudafor
+  use cuda_module
+  implicit none
+  
+  ! Matrix dimensions
+  integer, parameter :: WIDTH = 16
+  integer, parameter :: HEIGHT = 8
+  
+  ! Host arrays
+  integer, allocatable :: h_a(:,:), h_b(:,:), h_c(:,:), h_transposed(:,:)
+  
+  ! Device arrays
+  integer, device, allocatable :: d_a(:,:), d_b(:,:), d_c(:,:), d_transposed(:,:)
+  
+  ! Local variables
+  integer :: i, j, istat
+  type(dim3) :: blocks, threads
+  type(cudaEvent) :: start, stop
+  real :: milliseconds
+  logical :: additionCorrect = .true., transposeCorrect = .true.
+  
+  ! Create timing events
+  istat = cudaEventCreate(start)
+  istat = cudaEventCreate(stop)
+  milliseconds = 0.0
+  
+  ! Allocate host memory
+  allocate(h_a(WIDTH, HEIGHT), h_b(WIDTH, HEIGHT), h_c(WIDTH, HEIGHT))
+  allocate(h_transposed(HEIGHT, WIDTH))  ! Note dimensions are swapped for transposed matrix
+  
+  ! Initialize matrices on host
+  do j = 1, HEIGHT
+    do i = 1, WIDTH
+      h_a(i, j) = (j-1) * WIDTH + (i-1)  ! Sequential numbers
+      h_b(i, j) = WIDTH * HEIGHT - ((j-1) * WIDTH + (i-1)) - 1  ! Reverse order
+    end do
+  end do
+  
+  ! Allocate device memory
+  allocate(d_a(WIDTH, HEIGHT), d_b(WIDTH, HEIGHT), d_c(WIDTH, HEIGHT))
+  allocate(d_transposed(HEIGHT, WIDTH))  ! Note dimensions are swapped
+  
+  ! Copy from host to device
+  d_a = h_a
+  d_b = h_b
+  
+  ! Define block and grid dimensions
+  threads = dim3(8, 8, 1)  ! 8x8 threads per block = 64 threads
+  blocks = dim3((WIDTH + threads%x - 1) / threads%x, &
+                (HEIGHT + threads%y - 1) / threads%y, 1)
+  
+  write(*,*) 'Matrix dimensions: ', WIDTH, ' x ', HEIGHT
+  write(*,*) 'Block dimensions: ', threads%x, ' x ', threads%y
+  write(*,*) 'Grid dimensions: ', blocks%x, ' x ', blocks%y
+  
+  ! Execute matrix addition kernel
+  write(*,*) 'Executing matrix addition kernel...'
+  istat = cudaEventRecord(start, 0)
+  call matrixAdd<<<blocks, threads>>>(d_a, d_b, d_c, WIDTH, HEIGHT)
+  istat = cudaEventRecord(stop, 0)
+  istat = cudaEventSynchronize(stop)
+  istat = cudaEventElapsedTime(milliseconds, start, stop)
+  
+  ! Check for errors
+  istat = cudaGetLastError()
+  if (istat /= cudaSuccess) then
+    write(*,*) 'Addition Error: ', cudaGetErrorString(istat)
+    stop
+  end if
+  
+  ! Copy result back to host
+  h_c = d_c
+  
+  write(*,*) 'Matrix addition took ', milliseconds, ' ms'
+  
+  ! Execute matrix transposition kernel
+  write(*,*) 'Executing matrix transposition kernel...'
+  istat = cudaEventRecord(start, 0)
+  call matrixTranspose<<<blocks, threads>>>(d_a, d_transposed, WIDTH, HEIGHT)
+  istat = cudaEventRecord(stop, 0)
+  istat = cudaEventSynchronize(stop)
+  istat = cudaEventElapsedTime(milliseconds, start, stop)
+  
+  ! Check for errors
+  istat = cudaGetLastError()
+  if (istat /= cudaSuccess) then
+    write(*,*) 'Transposition Error: ', cudaGetErrorString(istat)
+    stop
+  end if
+  
+  ! Copy result back to host
+  h_transposed = d_transposed
+  
+  write(*,*) 'Matrix transposition took ', milliseconds, ' ms'
+  
+  ! Print the matrices (if they're small enough)
+  if (WIDTH <= 16 .and. HEIGHT <= 16) then
+    write(*,*) 'Matrix A:'
+    call printMatrix(h_a, WIDTH, HEIGHT)
+    
+    write(*,*) 'Matrix B:'
+    call printMatrix(h_b, WIDTH, HEIGHT)
+    
+    write(*,*) 'Matrix C (A + B):'
+    call printMatrix(h_c, WIDTH, HEIGHT)
+    
+    write(*,*) 'Transposed A:'
+    call printMatrix(h_transposed, HEIGHT, WIDTH)  ! Note swapped dimensions
+  end if
+  
+  ! Verify matrix addition result
+  do j = 1, HEIGHT
+    do i = 1, WIDTH
+      if (h_c(i, j) /= h_a(i, j) + h_b(i, j)) then
+        write(*,*) 'Addition verification failed at position (', i, ',', j, ')'
+        additionCorrect = .false.
+        exit
+      end if
+    end do
+    if (.not. additionCorrect) exit
+  end do
+  
+  if (additionCorrect) then
+    write(*,*) 'Matrix addition verification: SUCCESS'
+  end if
+  
+  ! Verify transposition result
+  do j = 1, HEIGHT
+    do i = 1, WIDTH
+      if (h_transposed(j, i) /= h_a(i, j)) then
+        write(*,*) 'Transpose verification failed at position (', i, ',', j, ')'
+        transposeCorrect = .false.
+        exit
+      end if
+    end do
+    if (.not. transposeCorrect) exit
+  end do
+  
+  if (transposeCorrect) then
+    write(*,*) 'Matrix transposition verification: SUCCESS'
+  end if
+  
+  ! Free device memory
+  deallocate(d_a, d_b, d_c, d_transposed)
+  
+  ! Free host memory
+  deallocate(h_a, h_b, h_c, h_transposed)
+  
+  ! Destroy timing events
+  istat = cudaEventDestroy(start)
+  istat = cudaEventDestroy(stop)
+
+contains
+
+  ! Function to print a matrix
+  subroutine printMatrix(matrix, width, height)
+    integer, intent(in) :: width, height
+    integer, intent(in) :: matrix(width, height)
+    integer :: i, j
+    
+    do j = 1, height
+      do i = 1, width
+        write(*, '(I5)', advance='no') matrix(i, j)
+      end do
+      write(*,*)
+    end do
+  end subroutine printMatrix
+  
+end program matrix_operations_fortran

@@ -1,0 +1,301 @@
+module cuda_module
+  use cudafor
+  use curand_device
+  implicit none
+  
+  contains
+  
+  attributes(global) subroutine randomArray(gpu_array, SIZE, seed)
+    real, device :: gpu_array(:)
+    integer(kind=8), value :: SIZE
+    integer, value :: seed
+    
+    ! Random number generator state
+    type(curandStateXORWOW) :: gpu_curand_state
+    
+    ! Global index in the array
+    integer(kind=8) :: global_index
+    
+    ! Number of iterations for each GPU thread
+    integer(kind=8) :: niter, i
+    
+    ! Initialize random state with seed
+    call curand_init(seed, blockIdx%x, threadIdx%x, gpu_curand_state)
+    
+    ! Calculate number of iterations
+    niter = SIZE/(gridDim%x*blockDim%x)
+    
+    ! Fill array with random values
+    do i = 0, niter-1
+      global_index = (blockIdx%x-1)*blockDim%x + threadIdx%x + i*gridDim%x*blockDim%x
+      if (global_index <= SIZE) then
+        gpu_array(global_index) = curand_uniform(gpu_curand_state)
+      end if
+    end do
+  end subroutine randomArray
+  
+end module cuda_module
+
+program memory_types_fortran
+  use cudafor
+  use cuda_module
+  implicit none
+  
+  ! Variables for array size and CUDA configuration
+  integer(kind=8) :: SIZE, gridsize, blocksize
+  character(len=32) :: arg
+  
+  ! Timing variables
+  integer :: istat, i
+  real :: start_time, end_time
+  real :: kernel_time, transfer_time, total_time
+  real :: pageable_total, pinned_total, mapped_total, unified_total
+  type(cudaEvent) :: start, stop
+  
+  ! Arrays for different memory types
+  real, allocatable :: cpu_array(:)
+  real, device, allocatable :: gpu_array(:)
+  real, allocatable, pinned :: pinned_array(:)
+  real, allocatable, managed :: unified_array(:)
+  
+  ! For mapped memory
+  real, allocatable, pinned :: host_array(:)
+  real, device, pointer :: device_array(:)
+  integer :: seed
+  
+  ! Check command line arguments
+  if (command_argument_count() /= 3) then
+    write(*,*) "Usage: memory_types_fortran <array_size> <grid_size> <block_size>"
+    write(*,*) "Example: memory_types_fortran 1048576 128 256"
+    stop
+  end if
+  
+  ! Parse arguments
+  call get_command_argument(1, arg)
+  read(arg, *) SIZE
+  
+  call get_command_argument(2, arg)
+  read(arg, *) gridsize
+  
+  call get_command_argument(3, arg)
+  read(arg, *) blocksize
+  
+  write(*,*) "Randomizing an array with ", SIZE, " elements"
+  
+  if (mod(SIZE, gridsize*blocksize) /= 0) then
+    write(*,*) "Warning: Array size is NOT divisible by grid_size * block_size"
+    write(*,*) "Some threads may be idle."
+  end if
+  
+  ! Set random seed
+  seed = int(secnds(0.0))
+  
+  ! Create CUDA events for timing
+  istat = cudaEventCreate(start)
+  istat = cudaEventCreate(stop)
+  
+  !--------------------------------------------------------------------------
+  ! 1. CONVENTIONAL CUDA MEMORY ACCESS (Pageable Memory)
+  !--------------------------------------------------------------------------
+  write(*,*) ""
+  write(*,*) "======= CONVENTIONAL CUDA MEMORY ACCESS (Pageable) ======="
+  
+  ! Start timing
+  call cpu_time(start_time)
+  
+  ! Allocate CPU and GPU arrays
+  allocate(cpu_array(SIZE))
+  allocate(gpu_array(SIZE))
+  
+  ! Time kernel execution
+  istat = cudaEventRecord(start, 0)
+  
+  ! Execute kernel
+  call randomArray<<<gridsize, blocksize>>>(gpu_array, SIZE, seed)
+  istat = cudaDeviceSynchronize()
+  
+  istat = cudaEventRecord(stop, 0)
+  istat = cudaEventSynchronize(stop)
+  istat = cudaEventElapsedTime(kernel_time, start, stop)
+  
+  write(*,*) "Elapsed time of GPU kernel execution: ", kernel_time/1000.0, " seconds"
+  
+  ! Time data transfer
+  istat = cudaEventRecord(start, 0)
+  
+  cpu_array = gpu_array
+  
+  istat = cudaEventRecord(stop, 0)
+  istat = cudaEventSynchronize(stop)
+  istat = cudaEventElapsedTime(transfer_time, start, stop)
+  
+  write(*,*) "Elapsed Time of the GPU-to-CPU data transfer: ", transfer_time/1000.0, " seconds"
+  
+  ! Calculate total time
+  call cpu_time(end_time)
+  pageable_total = end_time - start_time
+  write(*,*) "Total elapsed time: ", pageable_total, " seconds"
+  
+  ! Print first few elements
+  write(*,*) "First 5 elements: ", cpu_array(1:5)
+  
+  ! Free memory
+  deallocate(cpu_array)
+  deallocate(gpu_array)
+  
+  !--------------------------------------------------------------------------
+  ! 2. PINNED MEMORY ACCESS
+  !--------------------------------------------------------------------------
+  write(*,*) ""
+  write(*,*) "======= PINNED MEMORY ACCESS ======="
+  
+  ! Start timing
+  call cpu_time(start_time)
+  
+  ! Allocate pinned host memory and GPU memory
+  allocate(pinned_array(SIZE))
+  allocate(gpu_array(SIZE))
+  
+  ! Time kernel execution
+  istat = cudaEventRecord(start, 0)
+  
+  ! Execute kernel
+  call randomArray<<<gridsize, blocksize>>>(gpu_array, SIZE, seed)
+  istat = cudaDeviceSynchronize()
+  
+  istat = cudaEventRecord(stop, 0)
+  istat = cudaEventSynchronize(stop)
+  istat = cudaEventElapsedTime(kernel_time, start, stop)
+  
+  write(*,*) "Elapsed time of GPU kernel execution: ", kernel_time/1000.0, " seconds"
+  
+  ! Time data transfer
+  istat = cudaEventRecord(start, 0)
+  
+  pinned_array = gpu_array
+  
+  istat = cudaEventRecord(stop, 0)
+  istat = cudaEventSynchronize(stop)
+  istat = cudaEventElapsedTime(transfer_time, start, stop)
+  
+  write(*,*) "Elapsed Time of the GPU-to-CPU data transfer: ", transfer_time/1000.0, " seconds"
+  
+  ! Calculate total time
+  call cpu_time(end_time)
+  pinned_total = end_time - start_time
+  write(*,*) "Total elapsed time: ", pinned_total, " seconds"
+  
+  ! Print first few elements
+  write(*,*) "First 5 elements: ", pinned_array(1:5)
+  
+  ! Free memory
+  deallocate(pinned_array)
+  deallocate(gpu_array)
+  
+  !--------------------------------------------------------------------------
+  ! 3. ZERO-COPY CUDA MEMORY ACCESS (Mapped Memory)
+  !--------------------------------------------------------------------------
+  write(*,*) ""
+  write(*,*) "======= ZERO-COPY CUDA MEMORY ACCESS (Mapped) ======="
+  
+  ! Start timing
+  call cpu_time(start_time)
+  
+  ! Allocate host array with pinned memory
+  allocate(host_array(SIZE))
+  
+  ! Register host memory for mapped access
+  istat = cudaHostRegister(c_loc(host_array), SIZE * sizeof(host_array(1)), cudaHostRegisterMapped)
+  if (istat /= cudaSuccess) then
+    write(*,*) "Error registering host memory: ", istat
+    stop
+  end if
+  
+  ! Get device pointer to the host array
+  istat = cudaHostGetDevicePointer(c_devptr(device_array), c_loc(host_array), 0)
+  if (istat /= cudaSuccess) then
+    write(*,*) "Error getting device pointer: ", istat
+    stop
+  end if
+  
+  ! Time kernel execution
+  istat = cudaEventRecord(start, 0)
+  
+  ! Execute kernel
+  call randomArray<<<gridsize, blocksize>>>(device_array, SIZE, seed)
+  istat = cudaDeviceSynchronize()
+  
+  istat = cudaEventRecord(stop, 0)
+  istat = cudaEventSynchronize(stop)
+  istat = cudaEventElapsedTime(kernel_time, start, stop)
+  
+  write(*,*) "Elapsed time of GPU kernel execution: ", kernel_time/1000.0, " seconds"
+  
+  ! Calculate total time
+  call cpu_time(end_time)
+  mapped_total = end_time - start_time
+  write(*,*) "Total elapsed time: ", mapped_total, " seconds"
+  
+  ! Print first few elements
+  write(*,*) "First 5 elements: ", host_array(1:5)
+  
+  ! Unregister host memory before deallocating
+  istat = cudaHostUnregister(c_loc(host_array))
+  
+  ! Free memory
+  deallocate(host_array)
+  
+  !--------------------------------------------------------------------------
+  ! 4. UNIFIED MEMORY ACCESS
+  !--------------------------------------------------------------------------
+  write(*,*) ""
+  write(*,*) "======= UNIFIED MEMORY ACCESS ======="
+  
+  ! Start timing
+  call cpu_time(start_time)
+  
+  ! Allocate unified memory
+  allocate(unified_array(SIZE))
+  
+  ! Time kernel execution
+  istat = cudaEventRecord(start, 0)
+  
+  ! Execute kernel directly on unified memory
+  call randomArray<<<gridsize, blocksize>>>(unified_array, SIZE, seed)
+  istat = cudaDeviceSynchronize()
+  
+  istat = cudaEventRecord(stop, 0)
+  istat = cudaEventSynchronize(stop)
+  istat = cudaEventElapsedTime(kernel_time, start, stop)
+  
+  write(*,*) "Elapsed time of GPU kernel execution: ", kernel_time/1000.0, " seconds"
+  
+  ! Calculate total time
+  call cpu_time(end_time)
+  unified_total = end_time - start_time
+  write(*,*) "Total elapsed time: ", unified_total, " seconds"
+  
+  ! Print first few elements
+  write(*,*) "First 5 elements: ", unified_array(1:5)
+  
+  ! Free memory
+  deallocate(unified_array)
+  
+  !--------------------------------------------------------------------------
+  ! SUMMARY
+  !--------------------------------------------------------------------------
+  write(*,*) ""
+  write(*,*) "======= MEMORY ACCESS PERFORMANCE SUMMARY ======="
+  write(*,*) "Pageable Memory:  ", pageable_total, " seconds (baseline)"
+  write(*,*) "Pinned Memory:    ", pinned_total, " seconds (", &
+              pageable_total/pinned_total, "x vs pageable)"
+  write(*,*) "Mapped Memory:    ", mapped_total, " seconds (", &
+              pageable_total/mapped_total, "x vs pageable)"
+  write(*,*) "Unified Memory:   ", unified_total, " seconds (", &
+              pageable_total/unified_total, "x vs pageable)"
+  
+  ! Destroy CUDA events
+  istat = cudaEventDestroy(start)
+  istat = cudaEventDestroy(stop)
+  
+end program memory_types_fortran

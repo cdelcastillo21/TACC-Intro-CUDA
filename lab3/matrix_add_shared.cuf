@@ -1,0 +1,194 @@
+module cuda_module
+  use cudafor
+  implicit none
+  
+  integer, parameter :: TILE_WIDTH = 16
+  integer, parameter :: TILE_HEIGHT = 16
+  
+  contains
+  
+  ! Global memory version of matrix addition
+  attributes(global) subroutine matrixAddGlobal(d_a, d_b, d_c, width, height)
+    integer, value :: width, height
+    real, device, intent(in) :: d_a(width, height), d_b(width, height)
+    real, device, intent(out) :: d_c(width, height)
+    integer :: col, row
+    
+    ! Calculate the row and column indices for this thread
+    col = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    row = (blockIdx%y - 1) * blockDim%y + threadIdx%y
+    
+    ! Make sure we don't go out of bounds
+    if (col <= width .and. row <= height) then
+      ! Perform the addition directly from global memory
+      d_c(col, row) = d_a(col, row) + d_b(col, row)
+    end if
+  end subroutine matrixAddGlobal
+  
+  ! Shared memory version of matrix addition
+  attributes(global) subroutine matrixAddShared(d_a, d_b, d_c, width, height)
+    integer, value :: width, height
+    real, device, intent(in) :: d_a(width, height), d_b(width, height)
+    real, device, intent(out) :: d_c(width, height)
+    integer :: col, row
+    
+    ! Declare shared memory tiles for both input matrices
+    real, shared :: tileA(TILE_WIDTH, TILE_HEIGHT)
+    real, shared :: tileB(TILE_WIDTH, TILE_HEIGHT)
+    
+    ! Calculate the row and column indices for this thread
+    col = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    row = (blockIdx%y - 1) * blockDim%y + threadIdx%y
+    
+    ! Load data from global memory to shared memory
+    ! Each thread loads one element
+    if (col <= width .and. row <= height) then
+      tileA(threadIdx%x, threadIdx%y) = d_a(col, row)
+      tileB(threadIdx%x, threadIdx%y) = d_b(col, row)
+    else
+      ! Initialize out-of-bounds elements to zero
+      tileA(threadIdx%x, threadIdx%y) = 0.0
+      tileB(threadIdx%x, threadIdx%y) = 0.0
+    end if
+    
+    ! Make sure all threads have loaded their data before proceeding
+    call syncthreads()
+    
+    ! Perform the addition using the data in shared memory
+    if (col <= width .and. row <= height) then
+      d_c(col, row) = tileA(threadIdx%x, threadIdx%y) + tileB(threadIdx%x, threadIdx%y)
+    end if
+  end subroutine matrixAddShared
+  
+end module cuda_module
+
+program matrix_add_shared_fortran
+  use cudafor
+  use cuda_module
+  implicit none
+  
+  ! Matrix dimensions
+  integer, parameter :: WIDTH = 1024
+  integer, parameter :: HEIGHT = 1024
+  
+  ! Host arrays
+  real, allocatable :: h_a(:,:), h_b(:,:), h_c_global(:,:), h_c_shared(:,:)
+  
+  ! Device arrays
+  real, device, allocatable :: d_a(:,:), d_b(:,:), d_c_global(:,:), d_c_shared(:,:)
+  
+  ! Local variables
+  integer :: i, j, istat
+  type(dim3) :: blocks, threads
+  type(cudaEvent) :: start, stop
+  real :: global_milliseconds, shared_milliseconds
+  logical :: resultsMatch = .true.
+  real :: speedup
+  
+  ! Create timing events
+  istat = cudaEventCreate(start)
+  istat = cudaEventCreate(stop)
+  global_milliseconds = 0.0
+  shared_milliseconds = 0.0
+  
+  ! Allocate host memory
+  allocate(h_a(WIDTH, HEIGHT), h_b(WIDTH, HEIGHT))
+  allocate(h_c_global(WIDTH, HEIGHT), h_c_shared(WIDTH, HEIGHT))
+  
+  ! Initialize matrices on host with random values
+  call random_seed()
+  call random_number(h_a)
+  call random_number(h_b)
+  
+  ! Allocate device memory
+  allocate(d_a(WIDTH, HEIGHT), d_b(WIDTH, HEIGHT))
+  allocate(d_c_global(WIDTH, HEIGHT), d_c_shared(WIDTH, HEIGHT))
+  
+  ! Copy input data from host to device
+  d_a = h_a
+  d_b = h_b
+  
+  ! Define block and grid dimensions
+  threads = dim3(TILE_WIDTH, TILE_HEIGHT, 1)
+  blocks = dim3((WIDTH + threads%x - 1) / threads%x, &
+                (HEIGHT + threads%y - 1) / threads%y, 1)
+  
+  write(*,*) 'Matrix dimensions: ', WIDTH, ' x ', HEIGHT
+  write(*,*) 'Block dimensions: ', threads%x, ' x ', threads%y
+  write(*,*) 'Grid dimensions: ', blocks%x, ' x ', blocks%y
+  
+  ! Execute global memory version
+  write(*,*) 'Executing global memory version...'
+  istat = cudaEventRecord(start, 0)
+  call matrixAddGlobal<<<blocks, threads>>>(d_a, d_b, d_c_global, WIDTH, HEIGHT)
+  istat = cudaEventRecord(stop, 0)
+  istat = cudaEventSynchronize(stop)
+  istat = cudaEventElapsedTime(global_milliseconds, start, stop)
+  
+  ! Check for errors
+  istat = cudaGetLastError()
+  if (istat /= cudaSuccess) then
+    write(*,*) 'Global Memory Error: ', cudaGetErrorString(istat)
+    stop
+  end if
+  
+  ! Copy result back to host
+  h_c_global = d_c_global
+  
+  write(*,*) 'Global memory version took ', global_milliseconds, ' ms'
+  
+  ! Execute shared memory version
+  write(*,*) 'Executing shared memory version...'
+  istat = cudaEventRecord(start, 0)
+  call matrixAddShared<<<blocks, threads>>>(d_a, d_b, d_c_shared, WIDTH, HEIGHT)
+  istat = cudaEventRecord(stop, 0)
+  istat = cudaEventSynchronize(stop)
+  istat = cudaEventElapsedTime(shared_milliseconds, start, stop)
+  
+  ! Check for errors
+  istat = cudaGetLastError()
+  if (istat /= cudaSuccess) then
+    write(*,*) 'Shared Memory Error: ', cudaGetErrorString(istat)
+    stop
+  end if
+  
+  ! Copy result back to host
+  h_c_shared = d_c_shared
+  
+  write(*,*) 'Shared memory version took ', shared_milliseconds, ' ms'
+  
+  ! Verify results match between the two versions
+  do j = 1, HEIGHT
+    do i = 1, WIDTH
+      ! Using a small epsilon for floating point comparison
+      if (abs(h_c_global(i, j) - h_c_shared(i, j)) > 1.0e-5) then
+        write(*,*) 'Results do not match at position (', i, ',', j, '): ', &
+                   'global = ', h_c_global(i, j), ', shared = ', h_c_shared(i, j)
+        resultsMatch = .false.
+        exit
+      end if
+    end do
+    if (.not. resultsMatch) exit
+  end do
+  
+  if (resultsMatch) then
+    write(*,*) 'Results from global and shared memory versions match!'
+  end if
+  
+  ! Calculate and display speedup
+  if (global_milliseconds > 0.0) then
+    speedup = global_milliseconds / shared_milliseconds
+    write(*,*) 'Speedup from using shared memory: ', speedup, 'x'
+  end if
+  
+  ! Free device memory
+  deallocate(d_a, d_b, d_c_global, d_c_shared)
+  
+  ! Free host memory
+  deallocate(h_a, h_b, h_c_global, h_c_shared)
+  
+  ! Destroy timing events
+  istat = cudaEventDestroy(start)
+  istat = cudaEventDestroy(stop)
+  
+end program matrix_add_shared_fortran
