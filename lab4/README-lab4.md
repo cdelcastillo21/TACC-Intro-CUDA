@@ -1,6 +1,6 @@
-# Lab 4: Understanding Grace Hopper Memory Allocation Types
+# Lab 4: Understanding Memory Allocation Types
 
-This lab explores the different memory allocation approaches available in CUDA, with a focus on the memory architecture introduced in the NVIDIA Grace Hopper platform. We'll compare four memory allocation strategies: pageable memory, pinned memory, mapped memory, and unified memory.
+This lab explores the different memory allocation approaches available in CUDA. We'll compare four memory allocation strategies: pageable memory, pinned memory, mapped memory, and unified memory.
 
 ## Learning Objectives
 
