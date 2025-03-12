@@ -28,7 +28,7 @@ Explores the performance benefits of using shared memory in CUDA.
 - Performance comparison between global and shared memory
 - Tiling strategies
 
-### [Lab 4: Grace Hopper Memory Allocation Types](lab4/README-lab4.md)
+### [Lab 4: Memory Allocation Types](lab4/README-lab4.md)
 Compares four different memory allocation strategies in CUDA.
 - Pageable memory (conventional)
 - Pinned memory
