@@ -1,0 +1,540 @@
+module stream_processing_module
+  use cudafor
+  implicit none
+  
+  ! Constants
+  integer, parameter :: MB = 1024 * 1024
+  integer, parameter :: KB = 1024
+  
+  contains
+  
+  ! Simple kernel that performs vector squaring and adds a constant
+  attributes(global) subroutine processData(input, output, n, addValue)
+    real, device :: input(:)
+    real, device :: output(:)
+    integer, value :: n
+    real, value :: addValue
+    
+    integer :: idx
+    real :: val
+    
+    idx = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    if (idx <= n) then
+      val = input(idx)
+      val = val * val ! Square
+      val = val + addValue ! Add constant
+      output(idx) = val
+    end if
+  end subroutine processData
+  
+  ! Fills buffer with random data
+  subroutine fillRandomData(buffer, size)
+    real, intent(out) :: buffer(:)
+    integer, intent(in) :: size
+    
+    call random_number(buffer)
+  end subroutine fillRandomData
+  
+  ! Verifies that the output data is correct
+  function verifyResults(input, output, size, addValue) result(isCorrect)
+    real, intent(in) :: input(:)
+    real, intent(in) :: output(:)
+    integer, intent(in) :: size
+    real, intent(in) :: addValue
+    logical :: isCorrect
+    
+    integer :: i
+    real :: expected
+    
+    isCorrect = .true.
+    
+    do i = 1, size
+      expected = input(i) * input(i) + addValue
+      if (abs(output(i) - expected) > 1.0e-5) then
+        print *, "Verification failed at index ", i, ": got ", output(i), ", expected ", expected
+        isCorrect = .false.
+        return
+      end if
+    end do
+  end function verifyResults
+  
+  ! Function to print a progress bar
+  subroutine printProgressBar(progress)
+    real, intent(in) :: progress
+    integer, parameter :: barWidth = 50
+    integer :: pos, i
+    
+    pos = int(barWidth * progress)
+    
+    write(*, '(A)', advance='no') "["
+    do i = 1, barWidth
+      if (i <= pos) then
+        write(*, '(A)', advance='no') "="
+      else if (i == pos+1) then
+        write(*, '(A)', advance='no') ">"
+      else
+        write(*, '(A)', advance='no') " "
+      end if
+    end do
+    write(*, '(A,F5.1,A)', advance='no') "] ", progress * 100.0, "%\r"
+    call flush(6)
+  end subroutine printProgressBar
+  
+end module stream_processing_module
+
+program stream_processing_fortran
+  use cudafor
+  use stream_processing_module
+  implicit none
+  
+  ! Variables for array size and CUDA configuration
+  integer :: totalSizeMB, chunkSizeKB, numStreams
+  integer(kind=8) :: totalSizeBytes, chunkSizeBytes
+  integer :: numElements, chunkElements, numChunks
+  integer :: threadsPerBlock, blocksPerChunk
+  
+  ! Arrays
+  real, allocatable :: h_input(:), h_output(:)
+  real, allocatable, pinned :: h_input_pinned(:), h_output_pinned(:)
+  real, device, allocatable :: d_input(:), d_output(:)
+  
+  ! Multi-stream arrays
+  type(cudaStream_t), allocatable :: streams(:)
+  type(cudaEvent_t), allocatable :: events(:)
+  real, allocatable, pinned :: h_input_pinned_multi(:,:), h_output_pinned_multi(:,:)
+  real, device, allocatable :: d_input_multi(:,:), d_output_multi(:,:)
+  
+  ! Timing variables
+  type(cudaEvent_t) :: start, stop
+  real :: sequentialTime, asyncTime, multiStreamTime, pipelineTime
+  real :: sequentialThroughput, asyncThroughput, multiStreamThroughput, pipelineThroughput
+  
+  ! Other variables
+  real :: addValue = 10.0
+  character(len=16) :: arg
+  integer :: i, j, istat, chunk, streamIdx, offset, currentChunkElements
+  integer :: completedChunk, completedOffset, completedElements, remainingChunks
+  integer :: finalChunk, finalOffset, finalElements
+  logical :: sequentialCorrect, asyncCorrect, multiStreamCorrect, pipelineCorrect
+  
+  ! Parse command line arguments
+  if (command_argument_count() /= 3) then
+    print *, "Usage: stream_processing_fortran <total_size_MB> <chunk_size_KB> <num_streams>"
+    print *, "Example: stream_processing_fortran 1024 256 4"
+    stop
+  end if
+  
+  call get_command_argument(1, arg)
+  read(arg, *) totalSizeMB
+  
+  call get_command_argument(2, arg)
+  read(arg, *) chunkSizeKB
+  
+  call get_command_argument(3, arg)
+  read(arg, *) numStreams
+  
+  ! Calculate sizes in bytes
+  totalSizeBytes = int(totalSizeMB, 8) * MB
+  chunkSizeBytes = int(chunkSizeKB, 8) * KB
+  numElements = totalSizeBytes / 4 ! 4 bytes per real
+  chunkElements = chunkSizeBytes / 4
+  numChunks = (numElements + chunkElements - 1) / chunkElements ! Ceiling division
+  
+  ! Verify chunk size is valid
+  if (chunkElements <= 0) then
+    print *, "Error: Chunk size too small"
+    stop
+  end if
+  
+  ! Print configuration information
+  print *, ""
+  print *, "======= CUDA STREAMS AND ASYNCHRONOUS EXECUTION ======="
+  print *, "Total Data Size: ", totalSizeMB, " MB (", totalSizeBytes, " bytes, ", numElements, " elements)"
+  print *, "Chunk Size: ", chunkSizeKB, " KB (", chunkSizeBytes, " bytes, ", chunkElements, " elements)"
+  print *, "Number of Chunks: ", numChunks
+  print *, "Number of Streams: ", numStreams
+  print *, ""
+  
+  ! Initialize random seed
+  call random_seed()
+  
+  ! Create CUDA events for timing
+  istat = cudaEventCreate(start)
+  istat = cudaEventCreate(stop)
+  
+  ! Allocate host memory for full data
+  allocate(h_input(numElements))
+  allocate(h_output(numElements))
+  
+  ! Fill input with random data
+  call fillRandomData(h_input, numElements)
+  
+  ! Calculate grid dimensions for kernel launch
+  threadsPerBlock = 256
+  blocksPerChunk = (chunkElements + threadsPerBlock - 1) / threadsPerBlock
+  
+  !--------------------------------------------------------------------------
+  ! Approach 1: Sequential Execution (Baseline)
+  !--------------------------------------------------------------------------
+  print *, "Running Sequential Execution (Baseline)..."
+  
+  ! Allocate device memory
+  allocate(d_input(chunkElements))
+  allocate(d_output(chunkElements))
+  
+  ! Start timing
+  istat = cudaEventRecord(start, 0)
+  
+  do chunk = 1, numChunks
+    ! Calculate current chunk size (for last chunk handling)
+    offset = (chunk - 1) * chunkElements + 1
+    currentChunkElements = min(chunkElements, numElements - offset + 1)
+    
+    ! Copy input data (H2D)
+    d_input(1:currentChunkElements) = h_input(offset:offset+currentChunkElements-1)
+    
+    ! Launch kernel
+    call processData<<<blocksPerChunk, threadsPerBlock>>>(d_input, d_output, currentChunkElements, addValue)
+    
+    ! Wait for kernel to finish
+    istat = cudaDeviceSynchronize()
+    
+    ! Copy output data (D2H)
+    h_output(offset:offset+currentChunkElements-1) = d_output(1:currentChunkElements)
+    
+    ! Print progress
+    call printProgressBar(real(chunk) / numChunks)
+  end do
+  print *, ""
+  
+  ! Stop timing
+  istat = cudaEventRecord(stop, 0)
+  istat = cudaEventSynchronize(stop)
+  
+  ! Calculate elapsed time
+  istat = cudaEventElapsedTime(sequentialTime, start, stop)
+  
+  ! Verify results
+  sequentialCorrect = verifyResults(h_input, h_output, numElements, addValue)
+  
+  ! Calculate throughput
+  sequentialThroughput = totalSizeBytes / (sequentialTime * 1.0e-3) / MB ! MB/s
+  
+  ! Free device memory
+  deallocate(d_input)
+  deallocate(d_output)
+  
+  !--------------------------------------------------------------------------
+  ! Approach 2: Asynchronous Transfers with Pinned Memory
+  !--------------------------------------------------------------------------
+  print *, ""
+  print *, "Running Asynchronous Transfers with Pinned Memory..."
+  
+  ! Allocate pinned memory on host
+  allocate(h_input_pinned(chunkElements))
+  allocate(h_output_pinned(chunkElements))
+  
+  ! Allocate device memory
+  allocate(d_input(chunkElements))
+  allocate(d_output(chunkElements))
+  
+  ! Start timing
+  istat = cudaEventRecord(start, 0)
+  
+  do chunk = 1, numChunks
+    ! Calculate current chunk size
+    offset = (chunk - 1) * chunkElements + 1
+    currentChunkElements = min(chunkElements, numElements - offset + 1)
+    
+    ! Copy chunk to pinned memory
+    h_input_pinned(1:currentChunkElements) = h_input(offset:offset+currentChunkElements-1)
+    
+    ! Copy input data (H2D)
+    istat = cudaMemcpyAsync(d_input, h_input_pinned, currentChunkElements * 4, cudaMemcpyHostToDevice, 0)
+    
+    ! Launch kernel
+    call processData<<<blocksPerChunk, threadsPerBlock>>>(d_input, d_output, currentChunkElements, addValue)
+    
+    ! Copy output data (D2H)
+    istat = cudaMemcpyAsync(h_output_pinned, d_output, currentChunkElements * 4, cudaMemcpyDeviceToHost, 0)
+    
+    ! Synchronize to ensure this chunk is complete
+    istat = cudaDeviceSynchronize()
+    
+    ! Copy from pinned memory back to regular host memory
+    h_output(offset:offset+currentChunkElements-1) = h_output_pinned(1:currentChunkElements)
+    
+    ! Print progress
+    call printProgressBar(real(chunk) / numChunks)
+  end do
+  print *, ""
+  
+  ! Stop timing
+  istat = cudaEventRecord(stop, 0)
+  istat = cudaEventSynchronize(stop)
+  
+  ! Calculate elapsed time
+  istat = cudaEventElapsedTime(asyncTime, start, stop)
+  
+  ! Verify results
+  asyncCorrect = verifyResults(h_input, h_output, numElements, addValue)
+  
+  ! Calculate throughput
+  asyncThroughput = totalSizeBytes / (asyncTime * 1.0e-3) / MB ! MB/s
+  
+  ! Free memory
+  deallocate(h_input_pinned)
+  deallocate(h_output_pinned)
+  deallocate(d_input)
+  deallocate(d_output)
+  
+  !--------------------------------------------------------------------------
+  ! Approach 3: Multi-Stream Execution
+  !--------------------------------------------------------------------------
+  print *, ""
+  print *, "Running Multi-Stream Execution (", numStreams, " streams)..."
+  
+  ! Create CUDA streams
+  allocate(streams(numStreams))
+  do i = 1, numStreams
+    istat = cudaStreamCreate(streams(i))
+  end do
+  
+  ! Allocate pinned memory and device memory for each stream
+  allocate(h_input_pinned_multi(chunkElements, numStreams))
+  allocate(h_output_pinned_multi(chunkElements, numStreams))
+  allocate(d_input_multi(chunkElements, numStreams))
+  allocate(d_output_multi(chunkElements, numStreams))
+  
+  ! Start timing
+  istat = cudaEventRecord(start, 0)
+  
+  do chunk = 1, numChunks
+    ! Calculate stream index for this chunk
+    streamIdx = mod(chunk - 1, numStreams) + 1
+    
+    ! Calculate current chunk size
+    offset = (chunk - 1) * chunkElements + 1
+    currentChunkElements = min(chunkElements, numElements - offset + 1)
+    
+    ! Copy chunk to pinned memory
+    h_input_pinned_multi(1:currentChunkElements, streamIdx) = h_input(offset:offset+currentChunkElements-1)
+    
+    ! Copy input data (H2D)
+    istat = cudaMemcpyAsync(d_input_multi(:,streamIdx), h_input_pinned_multi(:,streamIdx), &
+                           currentChunkElements * 4, cudaMemcpyHostToDevice, streams(streamIdx))
+    
+    ! Launch kernel
+    call processData<<<blocksPerChunk, threadsPerBlock, 0, streams(streamIdx)>>>( &
+         d_input_multi(:,streamIdx), d_output_multi(:,streamIdx), currentChunkElements, addValue)
+    
+    ! Copy output data (D2H)
+    istat = cudaMemcpyAsync(h_output_pinned_multi(:,streamIdx), d_output_multi(:,streamIdx), &
+                           currentChunkElements * 4, cudaMemcpyDeviceToHost, streams(streamIdx))
+    
+    ! If we've filled all streams, synchronize the oldest stream and copy its data
+    if ((chunk >= numStreams) .and. (mod(chunk-1, numStreams) == numStreams-1)) then
+      do i = 1, numStreams
+        completedChunk = chunk - numStreams + i
+        completedOffset = (completedChunk - 1) * chunkElements + 1
+        completedElements = min(chunkElements, numElements - completedOffset + 1)
+        
+        istat = cudaStreamSynchronize(streams(i))
+        h_output(completedOffset:completedOffset+completedElements-1) = &
+                h_output_pinned_multi(1:completedElements, i)
+      end do
+    end if
+    
+    ! Print progress
+    call printProgressBar(real(chunk) / numChunks)
+  end do
+  
+  ! Synchronize remaining streams and copy final data
+  do i = 1, numStreams
+    istat = cudaStreamSynchronize(streams(i))
+    
+    remainingChunks = mod(numChunks, numStreams)
+    if (remainingChunks == 0) remainingChunks = numStreams
+    
+    if (i <= remainingChunks) then
+      finalChunk = numChunks - remainingChunks + i
+      finalOffset = (finalChunk - 1) * chunkElements + 1
+      finalElements = min(chunkElements, numElements - finalOffset + 1)
+      
+      h_output(finalOffset:finalOffset+finalElements-1) = h_output_pinned_multi(1:finalElements, i)
+    end if
+  end do
+  print *, ""
+  
+  ! Stop timing
+  istat = cudaEventRecord(stop, 0)
+  istat = cudaEventSynchronize(stop)
+  
+  ! Calculate elapsed time
+  istat = cudaEventElapsedTime(multiStreamTime, start, stop)
+  
+  ! Verify results
+  multiStreamCorrect = verifyResults(h_input, h_output, numElements, addValue)
+  
+  ! Calculate throughput
+  multiStreamThroughput = totalSizeBytes / (multiStreamTime * 1.0e-3) / MB ! MB/s
+  
+  !--------------------------------------------------------------------------
+  ! Approach 4: Fully Overlapped Pipeline
+  !--------------------------------------------------------------------------
+  print *, ""
+  print *, "Running Fully Overlapped Pipeline..."
+  
+  ! Create events for synchronization between iterations
+  allocate(events(numChunks))
+  do i = 1, numChunks
+    istat = cudaEventCreate(events(i))
+  end do
+  
+  ! Start timing
+  istat = cudaEventRecord(start, 0)
+  
+  ! Process chunks in a pipelined fashion
+  do chunk = 1, numChunks
+    ! Calculate stream index for this chunk
+    streamIdx = mod(chunk - 1, numStreams) + 1
+    
+    ! Calculate current chunk size
+    offset = (chunk - 1) * chunkElements + 1
+    currentChunkElements = min(chunkElements, numElements - offset + 1)
+    
+    ! Wait for previous iteration of this stream to finish D2H copy
+    if (chunk > numStreams) then
+      istat = cudaStreamWaitEvent(streams(streamIdx), events(chunk - numStreams), 0)
+      
+      ! Copy completed data to output
+      completedChunk = chunk - numStreams
+      completedOffset = (completedChunk - 1) * chunkElements + 1
+      completedElements = min(chunkElements, numElements - completedOffset + 1)
+      
+      h_output(completedOffset:completedOffset+completedElements-1) = &
+              h_output_pinned_multi(1:completedElements, streamIdx)
+    end if
+    
+    ! Copy chunk to pinned memory
+    h_input_pinned_multi(1:currentChunkElements, streamIdx) = h_input(offset:offset+currentChunkElements-1)
+    
+    ! Copy input data (H2D)
+    istat = cudaMemcpyAsync(d_input_multi(:,streamIdx), h_input_pinned_multi(:,streamIdx), &
+                           currentChunkElements * 4, cudaMemcpyHostToDevice, streams(streamIdx))
+    
+    ! Launch kernel
+    call processData<<<blocksPerChunk, threadsPerBlock, 0, streams(streamIdx)>>>( &
+         d_input_multi(:,streamIdx), d_output_multi(:,streamIdx), currentChunkElements, addValue)
+    
+    ! Copy output data (D2H)
+    istat = cudaMemcpyAsync(h_output_pinned_multi(:,streamIdx), d_output_multi(:,streamIdx), &
+                           currentChunkElements * 4, cudaMemcpyDeviceToHost, streams(streamIdx))
+    
+    ! Record event after D2H copy
+    istat = cudaEventRecord(events(chunk), streams(streamIdx))
+    
+    ! Print progress
+    call printProgressBar(real(chunk) / numChunks)
+  end do
+  
+  ! Process remaining data
+  do i = 1, numStreams
+    remainingChunks = min(numStreams, numChunks)
+    if (i <= remainingChunks) then
+      finalChunk = numChunks - remainingChunks + i
+      istat = cudaStreamSynchronize(streams(i))
+      
+      finalOffset = (finalChunk - 1) * chunkElements + 1
+      finalElements = min(chunkElements, numElements - finalOffset + 1)
+      
+      h_output(finalOffset:finalOffset+finalElements-1) = h_output_pinned_multi(1:finalElements, i)
+    end if
+  end do
+  print *, ""
+  
+  ! Stop timing
+  istat = cudaEventRecord(stop, 0)
+  istat = cudaEventSynchronize(stop)
+  
+  ! Calculate elapsed time
+  istat = cudaEventElapsedTime(pipelineTime, start, stop)
+  
+  ! Verify results
+  pipelineCorrect = verifyResults(h_input, h_output, numElements, addValue)
+  
+  ! Calculate throughput
+  pipelineThroughput = totalSizeBytes / (pipelineTime * 1.0e-3) / MB ! MB/s
+  
+  ! Clean up events
+  do i = 1, numChunks
+    istat = cudaEventDestroy(events(i))
+  end do
+  
+  !--------------------------------------------------------------------------
+  ! Performance Report
+  !--------------------------------------------------------------------------
+  print *, ""
+  print *, "======= PERFORMANCE RESULTS ======="
+  
+  print *, ""
+  print *, "Approach 1: Sequential Execution (Baseline)"
+  print *, "  Total Time: ", sequentialTime, " ms"
+  print *, "  Throughput: ", sequentialThroughput, " MB/s"
+  print *, "  Verification: ", merge("PASSED", "FAILED", sequentialCorrect)
+  
+  print *, ""
+  print *, "Approach 2: Asynchronous Transfers with Pinned Memory"
+  print *, "  Total Time: ", asyncTime, " ms"
+  print *, "  Throughput: ", asyncThroughput, " MB/s"
+  print *, "  Speedup vs Sequential: ", sequentialTime / asyncTime, "x"
+  print *, "  Verification: ", merge("PASSED", "FAILED", asyncCorrect)
+  
+  print *, ""
+  print *, "Approach 3: Multi-Stream Execution (", numStreams, " streams)"
+  print *, "  Total Time: ", multiStreamTime, " ms"
+  print *, "  Throughput: ", multiStreamThroughput, " MB/s"
+  print *, "  Speedup vs Sequential: ", sequentialTime / multiStreamTime, "x"
+  print *, "  Verification: ", merge("PASSED", "FAILED", multiStreamCorrect)
+  
+  print *, ""
+  print *, "Approach 4: Fully Overlapped Pipeline"
+  print *, "  Total Time: ", pipelineTime, " ms"
+  print *, "  Throughput: ", pipelineThroughput, " MB/s"
+  print *, "  Speedup vs Sequential: ", sequentialTime / pipelineTime, "x"
+  print *, "  Verification: ", merge("PASSED", "FAILED", pipelineCorrect)
+  
+  print *, ""
+  print *, "======= SUMMARY ======="
+  print *, "Sequential:   ", sequentialTime, " ms (baseline)"
+  print *, "Async:        ", asyncTime, " ms (", sequentialTime / asyncTime, "x speedup)"
+  print *, "Multi-Stream: ", multiStreamTime, " ms (", sequentialTime / multiStreamTime, "x speedup)"
+  print *, "Pipeline:     ", pipelineTime, " ms (", sequentialTime / pipelineTime, "x speedup)"
+  
+  !--------------------------------------------------------------------------
+  ! Cleanup
+  !--------------------------------------------------------------------------
+  
+  ! Destroy streams
+  do i = 1, numStreams
+    istat = cudaStreamDestroy(streams(i))
+  end do
+  
+  ! Free allocated memory
+  deallocate(streams)
+  deallocate(events)
+  deallocate(h_input_pinned_multi)
+  deallocate(h_output_pinned_multi)
+  deallocate(d_input_multi)
+  deallocate(d_output_multi)
+  deallocate(h_input)
+  deallocate(h_output)
+  
+  ! Destroy CUDA events
+  istat = cudaEventDestroy(start)
+  istat = cudaEventDestroy(stop)
+  
+  ! Reset device
+  istat = cudaDeviceReset()
+  
+end program stream_processing_fortran

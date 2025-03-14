@@ -1,60 +1,170 @@
-# TACC-Intro-CUDA
+# CUDA Programming
 
-Course materials for Introductory CUDA course. 
+This course provides a comprehensive introduction to CUDA programming, from basic concepts to some advanced optimization techniques. Through a series of hands-on labs, you'll learn how to harness the power of NVIDIA GPUs to accelerate computational tasks.
 
-This repository contains a series of programming labs designed to teach the fundamentals of GPU programming with NVIDIA CUDA.
-Each lab builds upon the previous one, introducing progressively more advanced concepts.
+## Course Overview
 
-## Lab Overview
+This course is designed for programmers who want to develop high-performance applications using NVIDIA's CUDA parallel computing platform. Each lab builds on the previous one, gradually introducing more complex concepts and techniques.
 
-### [Lab 1: Introduction to CUDA - Array Squaring](lab1/README-lab1.md)
-An introduction to the basic structure of CUDA programs through a simple array squaring example.
-- Basic CUDA kernel creation
-- Host and device memory management
+## Prerequisites
+
+- Basic knowledge of C/C++ or Fortran programming
+- Understanding of fundamental algorithms and data structures
+- Access to an NVIDIA GPU supporting CUDA
+- CUDA Toolkit installed
+- NVIDIA HPC SDK (for Fortran examples)
+
+## Lab Structure
+
+Each lab includes:
+- A detailed README with theoretical background
+- Complete source code in both C/C++ and Fortran
+- Compilation and execution instructions
+- Expected outputs and verification steps
+- Discussion questions and experiment ideas
+- Common issues and troubleshooting tips
+
+## Labs Overview
+
+### Lab 1: Introduction to CUDA - Array Squaring
+
+An introduction to the fundamental concepts of CUDA programming through a simple example of squaring each element of an array.
+
+**Key concepts:**
+- Basic CUDA program structure
+- Memory allocation and management
+- Simple kernel implementation
 - Thread/block configuration
 - Performance measurement
 
-### [Lab 2: CUDA 2D Blocks and Matrix Operations](lab2/README-lab2.md)
-Demonstrates how to use 2D thread and block configurations for matrix operations.
+### Lab 2: CUDA 2D Blocks and Matrix Operations
+
+Demonstrates how to use 2D thread and block configurations to perform matrix operations efficiently.
+
+**Key concepts:**
 - 2D thread and block organization
+- Global thread indexing in multiple dimensions
 - Matrix addition and transposition
-- Thread indexing in multiple dimensions
 - Performance comparison
 
-### [Lab 3: Shared Memory Matrix Addition](lab3/README-lab3.md)
-Explores the performance benefits of using shared memory in CUDA.
-- Shared memory concepts and declaration
-- Thread synchronization with `__syncthreads()`
-- Performance comparison between global and shared memory
-- Tiling strategies
+### Lab 3: Shared Memory Matrix Addition
 
-### [Lab 4: Memory Allocation Types](lab4/README-lab4.md)
-Compares four different memory allocation strategies in CUDA.
+Explores the performance benefits of using shared memory in CUDA by comparing two implementations of matrix addition.
+
+**Key concepts:**
+- Shared memory allocation and usage
+- Thread synchronization with `__syncthreads()`
+- Memory access patterns
+- Performance comparison with global memory
+
+### Lab 4: Grace Hopper Memory Allocation Types
+
+Investigates different memory allocation approaches available in CUDA, with a focus on the memory architecture introduced in the NVIDIA Grace Hopper platform.
+
+**Key concepts:**
 - Pageable memory (conventional)
 - Pinned memory
 - Mapped memory (zero-copy)
 - Unified memory
-- Performance analysis for different memory types
+- Performance characteristics of different memory types
 
-## Prerequisites
+### Lab 5: Parallel Reduction and Atomic Operations
 
-To complete these labs, you'll need:
-- NVIDIA GPU with CUDA support
-- CUDA Toolkit installed
-- C compiler compatible with CUDA
-- NVIDIA HPC SDK (for Fortran versions)
+This lab explores efficient parallel reduction techniques and atomic operations in CUDA. You'll implement and compare different approaches to calculating array sums and other aggregate operations.
 
-These labs are meant to be run on TACC's Vista cluster on the Grace-Hopper nodes (gh partition).
+**Key concepts:**
+- Parallel reduction algorithms
+- Shared memory optimization strategies
+- Warp-level primitives for efficient reduction
+- Atomic operations for concurrent memory updates
+- Performance analysis of different reduction strategies
 
-## Getting Started
+**Implementation highlights:**
+- Sequential CPU sum (baseline)
+- Naive global memory reduction
+- Shared memory optimized reduction
+- Warp-level reduction using shuffle instructions
+- Atomic operations-based reduction
 
-Each lab directory contains:
-- A detailed README.md file with instructions and discussion topics.
-- Source code in both C (.cu) and Fortran (.cuf) versions
-- Compilation and execution instructions
+**Performance considerations:**
+- Memory access patterns and coalescing
+- Bank conflict avoidance in shared memory
+- Synchronization overhead reduction
+- Warp divergence minimization
+- Atomic operation contention management
 
-Navigate to each lab directory and follow the instructions in the README.md file to compile and run the examples.
+### Lab 6: CUDA Streams and Asynchronous Execution
 
-## Learning Path
+This lab focuses on CUDA streams and asynchronous execution to achieve greater performance through overlapping computation with data transfers.
 
-These labs are designed to be completed in order, as each builds upon concepts introduced in previous labs. Start with Lab 1 to learn the fundamentals before progressing to more advanced topics.
+**Key concepts:**
+- CUDA streams for concurrent operations
+- Asynchronous memory transfers
+- Event-based synchronization
+- Stream scheduling and priority
+- Overlapping computation and data transfer
+
+**Implementation highlights:**
+- Sequential execution (baseline)
+- Asynchronous transfers with pinned memory
+- Multi-stream execution
+- Fully overlapped pipeline implementation
+- CUDA events for timing and synchronization
+
+**Performance considerations:**
+- Memory transfer bottlenecks
+- Kernel launch overhead
+- Stream synchronization points
+- Optimal chunk sizes for streaming
+- GPU resource utilization
+
+## Compilation and Execution
+
+### C/C++ Version
+
+For C/C++ implementations:
+
+```bash
+# Compile
+nvcc -o <executable_name> <source_file>.cu
+
+# Execute
+./<executable_name> [arguments]
+```
+
+### Fortran Version
+
+For Fortran implementations:
+
+```bash
+# Compile
+nvfortran -o <executable_name> <source_file>.cuf
+
+# Execute
+./<executable_name> [arguments]
+```
+
+## Advanced Topics and Further Study
+
+After completing these labs, you may want to explore:
+
+1. **CUDA Dynamic Parallelism**: Launch CUDA kernels from within CUDA kernels
+2. **Multi-GPU Programming**: Scale your applications across multiple GPUs
+3. **CUDA Graphs**: Define and execute graphs of operations
+4. **Tensor Cores**: Utilize specialized hardware for matrix operations
+5. **CUDA Libraries**: Leverage optimized libraries like cuBLAS, cuDNN, and Thrust
+
+## Troubleshooting Common Issues
+
+- **Compile Errors**: Ensure you have the correct CUDA Toolkit version installed
+- **Memory Errors**: Check for proper memory allocation, deallocation, and boundary checks
+- **Performance Issues**: Analyze memory access patterns and occupancy
+- **Synchronization Bugs**: Be careful with thread synchronization and race conditions
+- **Warp Divergence**: Minimize conditional branches within warps
+
+## Resources
+
+- [NVIDIA CUDA Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)
+- [NVIDIA CUDA Best Practices Guide](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/)
+- [NVIDIA CUDA Samples](https://github.com/NVIDIA/cuda-samples)
+- [NVIDIA Developer Forums](https://forums.developer.nvidia.com/c/accelerated-computing/cuda/178)

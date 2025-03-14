@@ -1,0 +1,455 @@
+module reduction_kernels
+  use cudafor
+  implicit none
+  
+  contains
+  
+  ! Kernel 1: Naive global memory reduction
+  attributes(global) subroutine globalMemoryReduction(input, output, size)
+    real, device :: input(:)
+    real, device :: output(:)
+    integer, value :: size
+    
+    integer :: tid, i, s
+    
+    ! Shared memory declaration
+    real, shared :: sdata(*)
+    
+    tid = threadIdx%x
+    i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    
+    ! Load input into shared memory
+    if (i <= size) then
+      sdata(tid) = input(i)
+    else
+      sdata(tid) = 0.0
+    endif
+    
+    call syncthreads()
+    
+    ! Reduction in shared memory
+    do s = blockDim%x/2, 1, -1
+      if (tid <= s) then
+        sdata(tid) = sdata(tid) + sdata(tid + s)
+      endif
+      call syncthreads()
+    enddo
+    
+    ! Write result for this block to global memory
+    if (tid == 1) then
+      output(blockIdx%x) = sdata(1)
+    endif
+  end subroutine globalMemoryReduction
+  
+  ! Kernel 2: Shared memory optimized reduction
+  attributes(global) subroutine sharedMemoryReduction(input, output, size)
+    real, device :: input(:)
+    real, device :: output(:)
+    integer, value :: size
+    
+    integer :: tid, i, s
+    
+    ! Shared memory declaration
+    real, shared :: sdata(*)
+    
+    tid = threadIdx%x
+    i = (blockIdx%x - 1) * (blockDim%x * 2) + threadIdx%x
+    
+    ! Load input into shared memory (with sequential addressing)
+    ! Each thread loads two elements
+    sdata(tid) = 0.0
+    
+    if (i <= size) then
+      sdata(tid) = sdata(tid) + input(i)
+    endif
+    
+    if (i + blockDim%x <= size) then
+      sdata(tid) = sdata(tid) + input(i + blockDim%x)
+    endif
+    
+    call syncthreads()
+    
+    ! Reduction in shared memory with sequential addressing
+    do s = blockDim%x/2, 1, -1
+      if (tid <= s) then
+        sdata(tid) = sdata(tid) + sdata(tid + s)
+      endif
+      call syncthreads()
+    enddo
+    
+    ! Write result for this block to global memory
+    if (tid == 1) then
+      output(blockIdx%x) = sdata(1)
+    endif
+  end subroutine sharedMemoryReduction
+  
+  ! Kernel 3: Warp-level reduction
+  attributes(global) subroutine warpLevelReduction(input, output, size)
+    real, device :: input(:)
+    real, device :: output(:)
+    integer, value :: size
+    
+    integer :: tid, i, lane, wid
+    real :: sum
+    
+    ! Shared memory for partial sums (per warp)
+    real, shared :: warpSum(*)
+    
+    tid = threadIdx%x
+    i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    
+    ! Each thread loads one element
+    sum = 0.0
+    if (i <= size) then
+      sum = input(i)
+    endif
+    
+    ! Warp shuffling for reduction
+    ! In Fortran CUDA, we'll approximate warp shuffle with shared memory
+    
+    ! Calculate lane and warp ID
+    lane = mod(tid-1, 32) + 1
+    wid = (tid-1) / 32 + 1
+    
+    ! First level reduction within each warp
+    do i = 16, 1, -1
+      ! Approximating shuffle with shared memory
+      sdata(tid) = sum
+      call syncthreads()
+      
+      if (lane <= i) then
+        sum = sum + sdata(tid + i)
+      endif
+      call syncthreads()
+    enddo
+    
+    ! First thread in each warp writes result to warp sum array
+    if (lane == 1) then
+      warpSum(wid) = sum
+    endif
+    
+    call syncthreads()
+    
+    ! Final reduction: first warp reduces all warp sums
+    if (wid == 1 .and. lane <= (blockDim%x / 32)) then
+      sum = warpSum(lane)
+      
+      ! Final warp reduction
+      do i = (blockDim%x/64), 1, -1
+        ! Approximating shuffle with shared memory
+        sdata(tid) = sum
+        call syncthreads()
+        
+        if (lane <= i) then
+          sum = sum + sdata(tid + i)
+        endif
+        call syncthreads()
+      enddo
+      
+      ! First thread updates global result
+      if (lane == 1) then
+        ! Atomic add in Fortran CUDA
+        call atomicadd(output(1), sum)
+      endif
+    endif
+  end subroutine warpLevelReduction
+  
+  ! Kernel 4: Atomic operations reduction
+  attributes(global) subroutine atomicReduction(input, output, size)
+    real, device :: input(:)
+    real, device :: output(:)
+    integer, value :: size
+    
+    integer :: i
+    
+    i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    
+    if (i <= size) then
+      call atomicadd(output(1), input(i))
+    endif
+  end subroutine atomicReduction
+  
+  ! Second-level reduction kernel for multi-block scenarios
+  attributes(global) subroutine finalReduction(input, output, size)
+    real, device :: input(:)
+    real, device :: output(:)
+    integer, value :: size
+    
+    integer :: tid, s
+    
+    ! Shared memory declaration
+    real, shared :: sdata(*)
+    
+    tid = threadIdx%x
+    
+    ! Load input into shared memory
+    if (tid <= size) then
+      sdata(tid) = input(tid)
+    else
+      sdata(tid) = 0.0
+    endif
+    
+    call syncthreads()
+    
+    ! Reduction in shared memory
+    do s = blockDim%x/2, 1, -1
+      if (tid <= s) then
+        sdata(tid) = sdata(tid) + sdata(tid + s)
+      endif
+      call syncthreads()
+    enddo
+    
+    ! Write result
+    if (tid == 1) then
+      output(1) = sdata(1)
+    endif
+  end subroutine finalReduction
+  
+end module reduction_kernels
+
+program parallel_reduction_fortran
+  use cudafor
+  use reduction_kernels
+  implicit none
+  
+  ! Variables for array size and CUDA configuration
+  integer :: SIZE, BLOCK_SIZE, NUM_RUNS
+  integer :: NUM_BLOCKS_GLOBAL, NUM_BLOCKS_SHARED
+  character(len=16) :: arg
+  
+  ! Arrays
+  real, allocatable :: h_data(:)
+  real :: h_result
+  real, device, allocatable :: d_data(:)
+  real, device :: d_result
+  real, device, allocatable :: d_temp(:)
+  
+  ! Timing variables
+  type(cudaEvent) :: start, stop
+  real :: cpu_time, global_time, shared_time, warp_time, atomic_time
+  real :: temp_time
+  integer :: istat, run
+  
+  ! Other variables
+  real :: cpu_sum
+  integer :: i, numWarps
+  
+  ! Parse command line arguments
+  if (command_argument_count() /= 3) then
+    write(*,*) "Usage: parallel_reduction_fortran <array_size> <block_size> <num_runs>"
+    write(*,*) "Example: parallel_reduction_fortran 16777216 256 10"
+    stop
+  end if
+  
+  call get_command_argument(1, arg)
+  read(arg, *) SIZE
+  
+  call get_command_argument(2, arg)
+  read(arg, *) BLOCK_SIZE
+  
+  call get_command_argument(3, arg)
+  read(arg, *) NUM_RUNS
+  
+  write(*,*) ""
+  write(*,*) "======= PARALLEL REDUCTION PERFORMANCE COMPARISON ======="
+  write(*,*) "Array Size: ", SIZE, " elements"
+  write(*,*) "Block Size: ", BLOCK_SIZE, " threads"
+  write(*,*) "Performance averaged over ", NUM_RUNS, " runs"
+  write(*,*) ""
+  
+  ! Allocate host memory
+  allocate(h_data(SIZE))
+  
+  ! Initialize data with random values
+  call random_seed()
+  call random_number(h_data)
+  
+  ! Allocate device memory
+  allocate(d_data(SIZE))
+  
+  ! Calculate grid dimensions
+  NUM_BLOCKS_GLOBAL = (SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE
+  NUM_BLOCKS_SHARED = (SIZE + (BLOCK_SIZE * 2) - 1) / (BLOCK_SIZE * 2)
+  
+  ! Allocate temporary device memory for multi-block reduction
+  allocate(d_temp(NUM_BLOCKS_GLOBAL))
+  
+  ! Copy data to device
+  d_data = h_data
+  
+  ! Create CUDA events for timing
+  istat = cudaEventCreate(start)
+  istat = cudaEventCreate(stop)
+  
+  !----------------------------------------------------------------------
+  ! CPU Reduction (Baseline)
+  !----------------------------------------------------------------------
+  istat = cudaEventRecord(start, 0)
+  
+  ! Calculate sum on CPU
+  cpu_sum = 0.0
+  do i = 1, SIZE
+    cpu_sum = cpu_sum + h_data(i)
+  end do
+  
+  istat = cudaEventRecord(stop, 0)
+  istat = cudaEventSynchronize(stop)
+  istat = cudaEventElapsedTime(cpu_time, start, stop)
+  
+  write(*,*) "CPU Sum: ", cpu_sum
+  write(*,*) "Execution Time: ", cpu_time, " ms"
+  write(*,*) ""
+  
+  !----------------------------------------------------------------------
+  ! 1. Naive Global Memory Reduction
+  !----------------------------------------------------------------------
+  global_time = 0.0
+  
+  do run = 1, NUM_RUNS
+    ! Reset result
+    d_result = 0.0
+    d_temp = 0.0
+    
+    istat = cudaEventRecord(start, 0)
+    
+    ! First step: reduce each block
+    call globalMemoryReduction<<<NUM_BLOCKS_GLOBAL, BLOCK_SIZE, BLOCK_SIZE*4>>>(d_data, d_temp, SIZE)
+    
+    ! Second step: reduce the block results
+    call finalReduction<<<1, min(1024, NUM_BLOCKS_GLOBAL), min(1024, NUM_BLOCKS_GLOBAL)*4>>>(d_temp, d_result, NUM_BLOCKS_GLOBAL)
+    
+    istat = cudaEventRecord(stop, 0)
+    istat = cudaEventSynchronize(stop)
+    
+    istat = cudaEventElapsedTime(temp_time, start, stop)
+    global_time = global_time + temp_time
+  end do
+  
+  global_time = global_time / NUM_RUNS
+  
+  ! Copy result back to host
+  h_result = d_result
+  
+  write(*,*) "Naive Global Memory Reduction:"
+  write(*,*) "Sum: ", h_result, merge(" (correct)", " (incorrect)", abs(h_result - cpu_sum) < 0.1)
+  write(*,*) "Execution Time: ", global_time, " ms"
+  write(*,*) "Speedup vs CPU: ", cpu_time / global_time, "x"
+  write(*,*) ""
+  
+  !----------------------------------------------------------------------
+  ! 2. Shared Memory Reduction
+  !----------------------------------------------------------------------
+  shared_time = 0.0
+  
+  do run = 1, NUM_RUNS
+    ! Reset result
+    d_result = 0.0
+    d_temp = 0.0
+    
+    istat = cudaEventRecord(start, 0)
+    
+    ! First step: reduce each block
+    call sharedMemoryReduction<<<NUM_BLOCKS_SHARED, BLOCK_SIZE, BLOCK_SIZE*4>>>(d_data, d_temp, SIZE)
+    
+    ! Second step: reduce the block results
+    call finalReduction<<<1, min(1024, NUM_BLOCKS_SHARED), min(1024, NUM_BLOCKS_SHARED)*4>>>(d_temp, d_result, NUM_BLOCKS_SHARED)
+    
+    istat = cudaEventRecord(stop, 0)
+    istat = cudaEventSynchronize(stop)
+    
+    istat = cudaEventElapsedTime(temp_time, start, stop)
+    shared_time = shared_time + temp_time
+  end do
+  
+  shared_time = shared_time / NUM_RUNS
+  
+  ! Copy result back to host
+  h_result = d_result
+  
+  write(*,*) "Shared Memory Reduction:"
+  write(*,*) "Sum: ", h_result, merge(" (correct)", " (incorrect)", abs(h_result - cpu_sum) < 0.1)
+  write(*,*) "Execution Time: ", shared_time, " ms"
+  write(*,*) "Speedup vs CPU: ", cpu_time / shared_time, "x"
+  write(*,*) ""
+  
+  !----------------------------------------------------------------------
+  ! 3. Warp-Level Reduction
+  !----------------------------------------------------------------------
+  warp_time = 0.0
+  
+  do run = 1, NUM_RUNS
+    ! Reset result
+    d_result = 0.0
+    
+    istat = cudaEventRecord(start, 0)
+    
+    numWarps = (BLOCK_SIZE + 31) / 32
+    call warpLevelReduction<<<NUM_BLOCKS_GLOBAL, BLOCK_SIZE, max(BLOCK_SIZE, numWarps*4)>>>(d_data, d_result, SIZE)
+    
+    istat = cudaEventRecord(stop, 0)
+    istat = cudaEventSynchronize(stop)
+    
+    istat = cudaEventElapsedTime(temp_time, start, stop)
+    warp_time = warp_time + temp_time
+  end do
+  
+  warp_time = warp_time / NUM_RUNS
+  
+  ! Copy result back to host
+  h_result = d_result
+  
+  write(*,*) "Warp-Level Reduction:"
+  write(*,*) "Sum: ", h_result, merge(" (correct)", " (incorrect)", abs(h_result - cpu_sum) < 0.1)
+  write(*,*) "Execution Time: ", warp_time, " ms"
+  write(*,*) "Speedup vs CPU: ", cpu_time / warp_time, "x"
+  write(*,*) ""
+  
+  !----------------------------------------------------------------------
+  ! 4. Atomic Reduction
+  !----------------------------------------------------------------------
+  atomic_time = 0.0
+  
+  do run = 1, NUM_RUNS
+    ! Reset result
+    d_result = 0.0
+    
+    istat = cudaEventRecord(start, 0)
+    
+    call atomicReduction<<<NUM_BLOCKS_GLOBAL, BLOCK_SIZE>>>(d_data, d_result, SIZE)
+    
+    istat = cudaEventRecord(stop, 0)
+    istat = cudaEventSynchronize(stop)
+    
+    istat = cudaEventElapsedTime(temp_time, start, stop)
+    atomic_time = atomic_time + temp_time
+  end do
+  
+  atomic_time = atomic_time / NUM_RUNS
+  
+  ! Copy result back to host
+  h_result = d_result
+  
+  write(*,*) "Atomic Reduction:"
+  write(*,*) "Sum: ", h_result, merge(" (correct)", " (incorrect)", abs(h_result - cpu_sum) < 0.1)
+  write(*,*) "Execution Time: ", atomic_time, " ms"
+  write(*,*) "Speedup vs CPU: ", cpu_time / atomic_time, "x"
+  write(*,*) ""
+  
+  !----------------------------------------------------------------------
+  ! Performance Summary
+  !----------------------------------------------------------------------
+  write(*,*) "======= PERFORMANCE SUMMARY ======="
+  write(*,*) "CPU Baseline:            ", cpu_time, " ms"
+  write(*,*) "Naive Global Reduction:  ", global_time, " ms (", cpu_time / global_time, "x speedup)"
+  write(*,*) "Shared Memory Reduction: ", shared_time, " ms (", cpu_time / shared_time, "x speedup)"
+  write(*,*) "Warp-Level Reduction:    ", warp_time, " ms (", cpu_time / warp_time, "x speedup)"
+  write(*,*) "Atomic Reduction:        ", atomic_time, " ms (", cpu_time / atomic_time, "x speedup)"
+  
+  ! Cleanup
+  istat = cudaEventDestroy(start)
+  istat = cudaEventDestroy(stop)
+  deallocate(d_data)
+  deallocate(d_temp)
+  deallocate(h_data)
+  
+end program parallel_reduction_fortran
